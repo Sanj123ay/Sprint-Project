@@ -1,0 +1,165 @@
+package stage3
+
+import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.sql.functions.{avg, col, lag, lit, max, min, when}
+
+object DerivedDataset {
+  def run(): Unit = {
+
+    // --------------------
+    // 0) Spark Session
+    // --------------------
+    val spark = SparkSession.builder()
+      .appName("ClimateMasterETL")
+      .master("local[*]")
+      .getOrCreate()
+
+    import spark.implicits._
+
+    // --------------------
+    // 1) Load datasets
+    // --------------------
+    val weather = spark.read.option("header", "true").option("inferSchema", "true")
+      .csv("data/yearly_dataset(final)/weather_yearly_2001_2023.csv")
+
+    val treeCover = spark.read.option("header", "true").option("inferSchema", "true")
+      .csv("data/yearly_dataset(final)/tree_cover_2001_2023.csv")
+
+    val co2 = spark.read.option("header", "true").option("inferSchema", "true")
+      .csv("data/yearly_dataset(final)/co2_2001_2023.csv")
+
+    // --------------------
+    // 2) Standardize units
+    // --------------------
+    val weatherProcessed = weather.withColumn("Sunshine_Duration", col("Sunshine_Duration") / 3600.0)
+
+    // --------------------
+    // 3) CO2 unit harmonization
+    // --------------------
+    val maxCo2 = co2.agg(max("co2").alias("max_co2")).first().getAs[Double]("max_co2")
+
+    val co2Harmonized = {
+      if (maxCo2 < 1000) {
+        co2.columns.foldLeft(co2)((df, c) =>
+          if (Seq("co2", "coal_co2", "oil_co2", "gas_co2", "cement_co2").contains(c))
+            df.withColumn(c, col(c) * 1000)
+          else df
+        )
+      } else if (maxCo2 > 1000000) {
+        co2.columns.foldLeft(co2)((df, c) =>
+          if (Seq("co2", "coal_co2", "oil_co2", "gas_co2", "cement_co2").contains(c))
+            df.withColumn(c, col(c) / 1000000)
+          else df
+        )
+      } else co2
+    }
+
+    // --------------------
+    // 4) Column renames for join
+    // --------------------
+    val co2Renamed = co2Harmonized
+      .withColumnRenamed("year", "Year")
+      .withColumnRenamed("country", "Country")
+
+    val treeRenamed = treeCover
+      .withColumnRenamed("tree_cover_loss__year", "Year")
+      .withColumnRenamed("Country Name", "Country")
+    // --------------------
+    // 5) Join datasets
+    // --------------------
+    var master = weatherProcessed
+      .join(co2Renamed, Seq("Country", "Year"), "inner")
+      .join(treeRenamed, Seq("Country", "Year"), "inner")
+
+    // --------------------
+    // 6) Derive base metrics
+    // --------------------
+    val windowSpec = Window.partitionBy("Country").orderBy("Year")
+
+    if (master.columns.contains("co2") && master.columns.contains("population")) {
+      master = master.withColumn("co2_per_capita_calc", (col("co2") * 1000000) / col("population"))
+    }
+
+    if (master.columns.contains("co2")) {
+      master = master
+        .withColumn("co2_growth_abs", col("co2") - lag("co2", 1).over(windowSpec))
+        .withColumn("co2_growth_prct", (col("co2") / lag("co2", 1).over(windowSpec) - 1) * 100)
+        .withColumn("co2_change_pct", col("co2_growth_prct"))
+    }
+
+    if (master.columns.contains("co2") && master.columns.contains("gdp")) {
+      master = master.withColumn("co2_per_gdp_kg_per_intl$", (col("co2") * 1000000000) / col("gdp"))
+    }
+
+    if (master.columns.contains("tree_cover_loss__ha") && master.columns.contains("tree_cover_extent_2000__ha")) {
+      master = master.withColumn("deforestation_pct",
+        (col("tree_cover_loss__ha") / col("tree_cover_extent_2000__ha")) * 100)
+    }
+
+    if (master.columns.contains("Temp_Mean")) {
+      val baseline = master.filter($"Year" >= 2001 && $"Year" <= 2005)
+        .groupBy("Country")
+        .agg(avg("Temp_Mean").alias("baseline_temp"))
+
+      master = master.join(baseline, Seq("Country"), "left")
+        .withColumn("temp_anomaly", col("Temp_Mean") - col("baseline_temp"))
+    }
+
+    // --------------------
+    // 7) Advanced metrics
+    // --------------------
+    val windowYear = Window.partitionBy("Year")
+
+    if (Seq("co2_per_capita_calc", "deforestation_pct", "temp_anomaly").forall(master.columns.contains)) {
+      master = master
+        .withColumn("co2_per_capita_norm",
+          (col("co2_per_capita_calc") - min("co2_per_capita_calc").over(windowYear)) /
+            (max("co2_per_capita_calc").over(windowYear) - min("co2_per_capita_calc").over(windowYear)))
+        .withColumn("deforestation_pct_norm",
+          (col("deforestation_pct") - min("deforestation_pct").over(windowYear)) /
+            (max("deforestation_pct").over(windowYear) - min("deforestation_pct").over(windowYear)))
+        .withColumn("temp_anomaly_norm",
+          (col("temp_anomaly") - min("temp_anomaly").over(windowYear)) /
+            (max("temp_anomaly").over(windowYear) - min("temp_anomaly").over(windowYear)))
+        .withColumn("climate_risk_index",
+          lit(0.4) * col("co2_per_capita_norm") +
+            lit(0.3) * col("deforestation_pct_norm") +
+            lit(0.3) * col("temp_anomaly_norm"))
+    }
+
+    if (master.columns.contains("co2_growth_prct")) {
+      master = master.withColumn("co2_spike_alert", when(col("co2_growth_prct") > 10, 1).otherwise(0))
+    }
+
+    if (master.columns.contains("deforestation_pct") && master.columns.contains("co2")) {
+      master = master.withColumn("deforestation_contribution_index",
+        when(col("co2") > 0, col("deforestation_pct") / col("co2")).otherwise(0))
+    }
+
+    if (master.columns.contains("Temp_Max") && master.columns.contains("baseline_temp")) {
+      master = master.withColumn("heatwave_indicator",
+        when(col("Temp_Max") > (col("baseline_temp") + 2), 1).otherwise(0))
+    }
+
+    if (master.columns.contains("Precipitation_Sum")) {
+      val windowCountry = Window.partitionBy("Country")
+      master = master.withColumn("precipitation_anomaly",
+        col("Precipitation_Sum") - avg("Precipitation_Sum").over(windowCountry))
+    }
+
+    // --------------------
+    // 8) Save transformed dataset
+    // --------------------
+    master.orderBy("Country", "Year")
+      .coalesce(1)
+      .write
+      .option("header", "true")
+      .option("nullValue", "null")
+      .csv("data/master_climate_transformed_final")
+
+    println("Transformation complete. File saved to /datasets/master_climate_transformed_final")
+
+    spark.stop()
+  }
+}
