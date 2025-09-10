@@ -1,0 +1,159 @@
+package stage1
+
+import org.apache.spark.sql.{SparkSession, DataFrame}
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types._
+import java.io.File
+import scala.reflect.io.Directory
+import scala.sys.process._
+
+object AggregatedDataset {
+
+  // -------------------------
+  // Helpers
+  // -------------------------
+  def ensureDir(path: String): Unit = {
+    val dir = new File(path)
+    if (!dir.exists()) dir.mkdirs()
+  }
+
+  def deletePath(path: String): Unit = {
+    val dir = new File(path)
+    if (dir.exists()) {
+      if (dir.isDirectory) {
+        val d = new Directory(dir)
+        d.deleteRecursively()
+      } else {
+        dir.delete()
+      }
+    }
+  }
+
+  def writeSingleCSV(df: DataFrame, finalPath: String): Unit = {
+    val tempDir = finalPath + "_tmpdir"
+    deletePath(finalPath)
+    deletePath(tempDir)
+
+    df.coalesce(1)
+      .write
+      .mode("overwrite")
+      .option("header", "true")
+      .csv(tempDir)
+
+    // Move the part-*.csv to desired filename
+    val partFile = new File(tempDir).listFiles().filter(_.getName.startsWith("part-")).head
+    val targetFile = new File(finalPath)
+    partFile.renameTo(targetFile)
+
+    // cleanup tempDir
+    deletePath(tempDir)
+  }
+
+  def run(): Unit = {
+    // -------------------------
+    // Spark session (local mode)
+    // -------------------------
+    val spark = SparkSession.builder()
+      .appName("Climate_ETL_Scala")
+      .master("local[*]")
+      .getOrCreate()
+
+    spark.sparkContext.setLogLevel("WARN")
+
+    // -------------------------
+    // Input paths
+    // -------------------------
+    val TREE_COVER_IN = "data/actual_datasets/consolidated_tree_cover_cleaned.csv"
+    val CO2_IN        = "data/actual_datasets/updated_transformed_owid_co2_data.csv"
+    val WEATHER_IN    = "data/actual_datasets/weather_data.csv"
+
+    // -------------------------
+    // Output paths
+    // -------------------------
+    ensureDir("data/filtered_datasets")
+    ensureDir("data/yearly_dataset(final)")
+
+    val FILTERED_TREE_OUT  = "data/filtered_datasets/filtered_tree_cover.csv"
+    val FILTERED_CO2_OUT   = "data/filtered_datasets/filtered_co2_data.csv"
+    val FILTERED_WEATH_OUT = "data/filtered_datasets/filtered_weather_data.csv"
+
+    val WEATHER_YEARLY_OUT = "data/yearly_dataset(final)/weather_yearly_2001_2023.csv"
+    val TREE_YEARLY_OUT    = "data/yearly_dataset(final)/tree_cover_2001_2023.csv"
+    val CO2_YEARLY_OUT     = "data/yearly_dataset(final)/co2_2001_2023.csv"
+
+    val YEAR_MIN = 2001
+    val YEAR_MAX = 2023
+
+    import spark.implicits._
+
+    // -------------------------
+    // Load datasets
+    // -------------------------
+    val treeCover = spark.read.option("header", "true").csv(TREE_COVER_IN)
+      .withColumn("tree_cover_loss__year", col("tree_cover_loss__year").cast(DoubleType))
+
+    val co2 = spark.read.option("header", "true").csv(CO2_IN)
+      .withColumn("year", col("year").cast(IntegerType))
+      .withColumn("co2", col("co2").cast(DoubleType))
+      .withColumn("population", col("population").cast(DoubleType))
+
+    val weatherDaily = spark.read.option("header", "true").csv(WEATHER_IN)
+      .withColumn("Date", to_date(col("Date"), "dd-MM-yyyy"))
+      .withColumn("Temp_Max", col("Temp_Max").cast(DoubleType))
+      .withColumn("Temp_Min", col("Temp_Min").cast(DoubleType))
+      .withColumn("Temp_Mean", col("Temp_Mean").cast(DoubleType))
+      .withColumn("Precipitation_Sum", col("Precipitation_Sum").cast(DoubleType))
+      .withColumn("Windspeed_Max", col("Windspeed_Max").cast(DoubleType))
+      .withColumn("Windgusts_Max", col("Windgusts_Max").cast(DoubleType))
+      .withColumn("Sunshine_Duration", col("Sunshine_Duration").cast(DoubleType))
+
+    // -------------------------
+    // Weather daily → yearly
+    // -------------------------
+    val weatherYearly = weatherDaily
+      .withColumn("Year", year(col("Date")))
+      .groupBy("Country", "Year")
+      .agg(
+        max("Temp_Max").alias("Temp_Max"),
+        min("Temp_Min").alias("Temp_Min"),
+        avg("Temp_Mean").alias("Temp_Mean"),
+        avg("Precipitation_Sum").alias("Precipitation_Sum"),
+        max("Windspeed_Max").alias("Windspeed_Max"),
+        max("Windgusts_Max").alias("Windgusts_Max"),
+        avg("Sunshine_Duration").alias("Sunshine_Duration")
+      )
+      .filter(col("Year").between(YEAR_MIN, YEAR_MAX))
+
+    // -------------------------
+    // Filter Tree Cover & CO₂ by countries in weather
+    // -------------------------
+    val weatherCountries = weatherYearly.select("Country").distinct()
+
+    val treeCoverFiltered = treeCover.join(weatherCountries, treeCover("Country Name") === weatherCountries("Country"), "left_semi")
+    val co2Filtered = co2.join(weatherCountries, co2("country") === weatherCountries("Country"), "left_semi")
+
+    val treeCover2001_2023 = treeCoverFiltered.filter(
+      col("tree_cover_loss__year").between(YEAR_MIN, YEAR_MAX)
+    )
+    val co22001_2023 = co2Filtered.filter(col("year").between(YEAR_MIN, YEAR_MAX))
+
+    val weatherYearlyOrdered = weatherYearly
+      .filter(col("Year").between(YEAR_MIN, YEAR_MAX))
+      .orderBy("Country", "Year")
+
+    // -------------------------
+    // Save results
+    // -------------------------
+    writeSingleCSV(treeCoverFiltered, FILTERED_TREE_OUT)
+    writeSingleCSV(co2Filtered, FILTERED_CO2_OUT)
+    writeSingleCSV(weatherYearlyOrdered, FILTERED_WEATH_OUT)
+
+    writeSingleCSV(weatherYearlyOrdered, WEATHER_YEARLY_OUT)
+    writeSingleCSV(treeCover2001_2023, TREE_YEARLY_OUT)
+    writeSingleCSV(co22001_2023, CO2_YEARLY_OUT)
+
+    println("ETL complete (Scala Spark local only).")
+
+    spark.stop()
+  }
+}
